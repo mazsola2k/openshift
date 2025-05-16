@@ -1,4 +1,5 @@
-# openshift
+# openshift automated installer
+
 Automated Installer for Redhat Openshift cluster / SNO
 
 pre-requisite: install a free developer access @ http://developer.redhat.com
