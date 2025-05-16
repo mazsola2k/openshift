@@ -2,7 +2,7 @@
 
 Automated Installer for Redhat Openshift cluster / SNO
 
-pre-requisite: install a free developer access @ http://developer.redhat.com
+pre-requisite: install a free developer access @ http://developer.redhat.com and a redhat 9 linux where you can automate the openshift installer creation
 
 sudo dnf install -y python3 python3-pip
 
