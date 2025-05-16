@@ -1,0 +1,294 @@
+---
+- name: Generate SSH Key, Store OpenShift Pull Secret, and Create install-config.yaml
+  hosts: localhost
+  gather_facts: yes
+
+  vars_prompt:
+    - name: ssh_email
+      prompt: "Enter the email for your SSH key (e.g., your_email@example.com)"
+      private: no
+      default: "your_email@example.com"
+    - name: ssh_key_path
+      prompt: "Enter file in which to save the key (e.g., ~/.ssh/id_rsa)"
+      private: no
+      default: "{{ lookup('env', 'HOME') + '/.ssh/id_rsa' }}"
+    - name: ssh_passphrase
+      prompt: "Enter passphrase (empty for no passphrase)"
+      private: yes
+      default: ""
+    - name: pull_secret_content
+      prompt: |
+        After you logged into redhat.com / developer.redhat.com,
+        go to https://cloud.redhat.com/openshift/install/pull-secret
+        Please copy and paste your OpenShift pull secret JSON content below.
+        (Paste the entire JSON as a single line, then press ENTER)
+      private: no
+    - name: host_name
+      prompt: "Enter the host name"
+      private: no
+      default: "hostname"
+    - name: base_domain
+      prompt: "Enter the base domain"
+      private: no
+      default: "domain"
+    - name: cluster_name
+      prompt: "Enter the cluster name"
+      private: no
+      default: "openshift-cluster"      
+    - name: machine_cidr
+      prompt: "Enter the machine network CIDR"
+      private: no
+      default: "192.168.128.0/24"
+    - name: agent_ip
+      prompt: "Enter the host IP address"
+      private: no
+      default: "192.168.128.130"
+    - name: agent_prefix_length
+      prompt: "Enter the network prefix length"
+      private: no
+      default: "24"
+    - name: agent_mac
+      prompt: "Enter the MAC address"
+      private: no
+      default: "00:0c:29:18:a7:c3"
+    - name: agent_device
+      prompt: "Enter the storage device name"
+      private: no
+      default: "/dev/nvme0n1"
+    - name: agent_dns
+      prompt: "Enter the DNS resolver server IP"
+      private: no
+      default: "192.168.128.2"
+    - name: agent_gw
+      prompt: "Enter the router default gateway (next-hop-address)"
+      private: no
+      default: "192.168.128.2"
+
+  pre_tasks:
+    - name: Cleanup old OpenShift install files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ playbook_dir }}/agent.x86_64.iso"
+        - "{{ playbook_dir }}/rendezvousIP"
+        - "{{ playbook_dir }}/.openshift_install.log"
+        - "{{ playbook_dir }}/.openshift_install_state.json"
+      tags:
+        - cleanup
+
+  tasks:
+    - name: Generate SSH key with ssh-keygen
+      command: ssh-keygen -t rsa -b 4096 -C "{{ ssh_email }}" -f "{{ ssh_key_path }}" {% if ssh_passphrase %}-N "{{ ssh_passphrase }}"{% else %}-N ""{% endif %}
+      args:
+        creates: "{{ ssh_key_path }}"
+      tags:
+        - ssh-key
+
+    - name: Read generated public key
+      slurp:
+        src: "{{ ssh_key_path }}.pub"
+      register: pubkey_content
+      tags:
+        - ssh-key
+
+    - name: Show public key
+      debug:
+        msg: "Your SSH public key:\n{{ pubkey_content.content | b64decode }}"
+      tags:
+        - ssh-key
+
+    - name: Save pull-secret.json
+      copy:
+        content: "{{ pull_secret_content }}"
+        dest: ./pull-secret.json
+        mode: '0600'
+      tags:
+        - pull-secret
+
+    - name: Create install-config.yaml
+      copy:
+        dest: ./install-config.yaml
+        mode: '0600'
+        content: |
+          apiVersion: v1
+          baseDomain: {{ base_domain }}
+          compute:
+          - architecture: amd64
+            hyperthreading: Enabled
+            name: worker
+            replicas: 0
+          controlPlane:
+            architecture: amd64
+            hyperthreading: Enabled
+            name: {{ host_name }}
+            replicas: 1
+          metadata:
+            name: {{ host_name }}
+          networking:
+            clusterNetwork:
+            - cidr: 10.128.0.0/14
+              hostPrefix: 23
+            machineNetwork:
+            - cidr: {{ machine_cidr }}
+            networkType: OVNKubernetes
+            serviceNetwork:
+            - 172.30.0.0/16
+          platform:
+            none: {}
+          pullSecret: '{{ pull_secret_content }}'
+          sshKey: |
+            {{ pubkey_content.content | b64decode }}
+
+      tags:
+        - install-config
+
+    - name: Create agent-config.yaml
+      copy:
+        dest: ./agent-config.yaml
+        mode: '0600'
+        content: |
+          apiVersion: v1beta1
+          kind: AgentConfig
+          metadata:
+            name: {{ cluster_name }}
+          rendezvousIP: {{ agent_ip }}
+          hosts:
+            - hostname: {{ host_name }}
+              interfaces:
+                - name: eno1
+                  macAddress: {{ agent_mac }}
+              rootDeviceHints:
+                deviceName: {{ agent_device }}
+              networkConfig:
+                interfaces:
+                  - name: eno1
+                    type: ethernet
+                    state: up
+                    mac-address: {{ agent_mac }}
+                    ipv4:
+                      enabled: true
+                      address:
+                        - ip: {{ agent_ip }}
+                          prefix-length: {{ agent_prefix_length }}
+                      dhcp: false
+                dns-resolver:
+                  config:
+                    server:
+                      - {{ agent_dns }}
+                routes:
+                  config:
+                    - destination: 0.0.0.0/0
+                      next-hop-address: {{ agent_gw }}
+                      next-hop-interface: eno1
+                      table-id: 254
+
+      tags:
+        - agent-config
+
+    - name: Download openshift-install
+      get_url:
+        url: https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-install-linux.tar.gz
+        dest: ./openshift-install-linux.tar.gz
+        mode: '0644'
+      tags:
+        - openshift-install
+
+    - name: Uncompress openshift-install
+      unarchive:
+        src: ./openshift-install-linux.tar.gz
+        dest: ./
+        remote_src: yes
+      tags:
+        - openshift-install
+
+    - name: Run OpenShift installer to create agent ISO
+      command: ./openshift-install agent create image
+      args:
+        chdir: "{{ playbook_dir }}"
+      register: iso_creation      
+      tags:
+        - create-iso
+
+    - name: Show created ISO file location
+      find:
+        paths: "{{ playbook_dir }}"
+        patterns: "*.iso"
+        recurse: no
+      register: iso_files
+      tags:
+        - create-iso
+
+    - name: Print ISO creation result
+      debug:
+        msg: |
+          OpenShift installer ISO creation output:
+          {{ iso_creation.stdout }}
+          {% if iso_files.files|length > 0 %}
+          Created ISO file(s):
+          {% for file in iso_files.files %}
+            - {{ file.path }}
+          {% endfor %}
+          {% else %}
+          No ISO file found in {{ playbook_dir }}
+          {% endif %}
+      tags:
+        - create-iso
+
+    - name: Print success message
+      debug:
+        msg: |
+          Pull secret saved to ./pull-secret.json
+          install-config.yaml created as ./install-config.yaml
+          agent-config.yaml created as ./agent-config.yaml
+          openshift-install downloaded and extracted in current directory
+
+    - name: Show ./auth folder contents if exists
+      find:
+        paths: "{{ playbook_dir }}/auth"
+        file_type: file
+      register: auth_files
+      tags:
+        - post-install
+
+    - name: Print ./auth folder files
+      debug:
+        msg: |
+          The ./auth directory contains the following files:
+          {% if auth_files.files|length > 0 %}
+          {% for file in auth_files.files %}
+            - {{ file.path | basename }}
+          {% endfor %}
+          {% else %}
+          No files found in ./auth directory.
+          {% endif %}
+      tags:
+        - post-install
+
+    - name: Show kubeadmin password if present
+      slurp:
+        src: "{{ playbook_dir }}/auth/kubeadmin-password"
+      register: kubeadmin_password_file
+      ignore_errors: yes
+      tags:
+        - post-install
+
+    - name: Print kubeadmin password
+      debug:
+        msg: |
+          {% if kubeadmin_password_file.content is defined %}
+          Your OpenShift kubeadmin password is:
+          {{ kubeadmin_password_file.content | b64decode | regex_replace('\\\\n|\\n', '') }}
+          {% else %}
+          kubeadmin-password file not found in ./auth directory.
+          {% endif %}
+      tags:
+        - post-install
+    
+    - name: Print OpenShift web console URL
+      debug:
+        msg: >-
+          After ISO installation on the target host, open your OpenShift web console:
+          https://console-openshift-console.apps.{{ host_name }}.{{ base_domain }}/
+      tags:
+        - post-install
